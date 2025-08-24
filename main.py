@@ -25,7 +25,7 @@ app = FastAPI(title="GuardRail Wrapper (MVP)")
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://<your-vercel-app>.vercel.app",  # add after deploy
+    "guardrail-admin-89m0y5mn4-dayrons-projects-227a32b9.vercel.app",  # add after deploy
 ]
 
 app.add_middleware(
