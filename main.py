@@ -5,6 +5,24 @@ from pydantic import BaseModel
 from typing import List, Dict, Any
 import re, os, json, time, sqlite3
 
+from pydantic import BaseModel
+from typing import List
+
+class Incident(BaseModel):
+    id: int
+    time: str
+    provider: str
+    flagged: bool
+    redactions: List[str]
+
+# In-memory store for demo
+INCIDENTS: List[Incident] = []
+
+@app.get("/incidents", response_model=List[Incident])
+def get_incidents(limit: int = 10):
+    # Return newest first, limited
+    return list(reversed(INCIDENTS))[:limit]
+
 # --- Optional OpenAI (defaults to mock echo) ---
 from dotenv import load_dotenv
 load_dotenv()
