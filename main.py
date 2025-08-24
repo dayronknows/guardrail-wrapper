@@ -19,38 +19,30 @@ if USE_OPENAI:
         USE_OPENAI = False  # fall back to mock if package missing
 
 # --- FastAPI app + CORS ---
-app = FastAPI(title="GuardRail Wrapper (MVP)")
-
+# ---- FastAPI app + CORS ----
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+app = FastAPI(title="GuardRail Wrapper (MVP)")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],        # TEMP: open for test
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=False,    # must be False when using "*"
-)
-
-# Explicitly declare the allowed origins for your frontend
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "guardrail-admin.vercel.app",  # add after deploy
+    "https://guardrail-admin.vercel.app",   # your Vercel UI
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=ALLOWED_ORIGINS,  # use explicit origins for production
+    allow_credentials=False,        # set True only if you really need cookies/auth
+    allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
-# Explicit OPTIONS handler (belt and suspenders)
-@app.options("/chat")
-def options_chat():
+# (Optional) belt‑and‑suspenders: handle preflight for any route
+@app.options("/{rest_of_path:path}")
+def options_catchall(rest_of_path: str) -> Response:
     return Response(status_code=204)
 
 # --- SQLite setup ---
