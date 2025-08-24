@@ -40,6 +40,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "https://guardrail-admin.vercel.app",  # your Vercel frontend
+    "dayronknows.me"
 ]
 
 app.add_middleware(
@@ -168,6 +169,12 @@ class ChatOut(BaseModel):
     flagged: bool
     redactions: List[str]
 
+class ChatRequest(BaseModel):
+    # Accept either new or old payloads
+    prompt: Optional[str] = None
+    message: Optional[str] = None
+    user: Optional[str] = None
+
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -260,16 +267,34 @@ def scan(req: ScanRequest):
     )
 
 
-@app.post("/chat", response_model=ChatOut)
-def chat(body: ChatIn):
-    """Used by the 'Quick Chat' card."""
+@app.post("/chat")
+def chat(req: ChatRequest):
+    # normalize the text
+    input_text = (req.prompt or req.message or "").strip()
+    if not input_text:
+        raise HTTPException(status_code=422, detail={"type": "missing", "loc": ["body","prompt|message"]})
+
+    # 1) Get model output (mock or OpenAI)
+    if USE_OPENAI:
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": input_text}],
+            )
+            llm_output = completion.choices[0].message.content or ""
+            provider = "openai"
+        except Exception:
+            llm_output = f"(mock) Answer to: {input_text}"
+            provider = "mock"
+    else:
+        llm_output = f"(mock) Answer to: {input_text}"
+        provider = "mock"
+
+    # 2) Guardrails
+    pii = redact_pii(llm_output)
+
+    # 3) Persist
     ensure_schema()
-    model = run_model(body.message)
-    raw = model["output"]
-    provider = model["provider"]
-
-    pii = redact_pii(raw)
-
     db_exec(
         """
         INSERT INTO logs (ts, provider, input_text, raw_output, redacted_output, flagged, redactions_json)
@@ -278,19 +303,20 @@ def chat(body: ChatIn):
         (
             int(time.time()),
             provider,
-            body.message,
-            raw,
+            input_text,
+            llm_output,
             pii["output"],
             1 if pii["flagged"] else 0,
             json.dumps(pii["redactions"]),
         ),
     )
 
-    return ChatOut(
-        answer=pii["output"],
-        flagged=pii["flagged"],
-        redactions=[d.get("type", "other") for d in pii["redactions"]],
-    )
+    # 4) Response (keeps the existing UI happy)
+    return {
+        "answer": pii["output"],
+        "flagged": pii["flagged"],
+        "redactions": [r.get("type","other") for r in pii["redactions"]],
+    }
 
 
 @app.get("/metrics")
