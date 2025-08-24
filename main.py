@@ -21,6 +21,18 @@ if USE_OPENAI:
 # --- FastAPI app + CORS ---
 app = FastAPI(title="GuardRail Wrapper (MVP)")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # TEMP: open for test
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,    # must be False when using "*"
+)
+
 # Explicitly declare the allowed origins for your frontend
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
