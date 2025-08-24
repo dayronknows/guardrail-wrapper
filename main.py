@@ -34,7 +34,7 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,  # use explicit origins for production
-    allow_credentials=False,        # set True only if you really need cookies/auth
+    allow_credentials=True,        # set True only if you really need cookies/auth
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
