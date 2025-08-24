@@ -24,7 +24,8 @@ app = FastAPI(title="GuardRail Wrapper (MVP)")
 # Explicitly declare the allowed origins for your frontend
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
-    "http://127.0.0.1:3000"
+    "http://127.0.0.1:3000",
+    "https://<your-vercel-app>.vercel.app",  # add after deploy
 ]
 
 app.add_middleware(
