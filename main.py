@@ -1,59 +1,79 @@
 # main.py
-import os, re, time, json, sqlite3
-from typing import List, Dict, Any, Optional
-
-from fastapi import FastAPI, Query, HTTPException, BackgroundTasks, Response
+from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv
+from typing import List, Dict, Any, Optional
+import re, os, json, time, sqlite3
 
-# ---------------------------
-# Env + optional OpenAI client
-# ---------------------------
+# ---------- Models ----------
+class Incident(BaseModel):
+    id: int
+    time: str           # ISO-like string from SQLite datetime
+    provider: str
+    flagged: bool
+    redactions: List[str]
+
+INCIDENTS: List[Incident] = []  # in-memory cache for demo (derived from DB)
+
+class ChatRequest(BaseModel):
+    # allow either {prompt} OR {user, message}
+    prompt: Optional[str] = None
+    user: Optional[str] = None
+    message: Optional[str] = None
+
+class ChatReply(BaseModel):
+    answer: str
+    flagged: bool
+    redactions: List[str]
+
+class ScanRequest(BaseModel):
+    prompt: str
+
+class ScanResponse(BaseModel):
+    raw_output: str
+    redacted_output: str
+    flagged: bool
+    incidents: List[Incident]
+
+# ---------- OpenAI (optional, defaults to mock) ----------
+from dotenv import load_dotenv
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PROVIDER = os.getenv("PROVIDER", "mock").lower()  # "openai" or "mock"
 USE_OPENAI = bool(OPENAI_API_KEY) and PROVIDER == "openai"
-
 if USE_OPENAI:
     try:
         from openai import OpenAI
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
         USE_OPENAI = False
 
-# ---------------------------
-# App + CORS
-# ---------------------------
+# ---------- FastAPI + CORS ----------
 app = FastAPI(title="GuardRail Wrapper (MVP)")
 
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://guardrail-admin.vercel.app",   # your Vercel UI
-    "dayronknows.me"
-    # add your Squarespace domain if embedding:
-    # "https://<your-site>.squarespace.com",
-    # "https://www.<your-domain>.com",
+    # add your deployed UI domain(s):
+    "https://guardrail-admin.vercel.app",
+    # add Squarespace page host if you embed:
+    # "https://<your-squarespace-domain>"
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
-# Preflight (belt & suspenders)
 @app.options("/{rest_of_path:path}")
 def options_catchall(rest_of_path: str) -> Response:
     return Response(status_code=204)
 
-# ---------------------------
-# SQLite storage
-# ---------------------------
+# ---------- SQLite ----------
 DB_PATH = os.getenv("DB_PATH", "guardrail.db")
 
 def db_exec(sql: str, params: tuple = ()):
@@ -71,7 +91,8 @@ def db_query(sql: str, params: tuple = ()):
     try:
         cur = conn.cursor()
         cur.execute(sql, params)
-        return cur.fetchall()
+        rows = cur.fetchall()
+        return rows
     finally:
         conn.close()
 
@@ -93,9 +114,7 @@ def ensure_schema():
 
 ensure_schema()
 
-# ---------------------------
-# PII redaction helpers
-# ---------------------------
+# ---------- Guardrails (PII redaction) ----------
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE_RE = re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b")
 SSN_RE   = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
@@ -119,138 +138,62 @@ def redact_pii(text: str) -> Dict[str, Any]:
     out = PHONE_RE.sub(repl_phone, out)
     out = SSN_RE.sub(repl_ssn, out)
 
+    flagged = len(redactions) > 0
     return {
         "output": out,
-        "flagged": bool(redactions),
+        "flagged": flagged,
         "redactions": redactions,
         "checks_ran": ["pii_redaction_v1"],
     }
 
-# ---------------------------
-# Models
-# ---------------------------
-class ScanRequest(BaseModel):
-    prompt: str
+# ---------- Helpers ----------
+def call_llm(input_text: str) -> (str, str):
+    """Return (raw_output, provider). Uses OpenAI if configured else mock."""
+    if USE_OPENAI:
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": input_text}],
+            )
+            return completion.choices[0].message.content or "", "openai"
+        except Exception:
+            pass
+    return f"(mock) Answer to: {input_text}", "mock"
 
-class ChatRequest(BaseModel):
-    user: str
-    message: str
+def persist_and_emit(raw: str, redacted: Dict[str, Any], provider: str, input_text: str):
+    ensure_schema()
+    db_exec(
+        """
+        INSERT INTO logs (ts, provider, input_text, raw_output, redacted_output, flagged, redactions_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(time.time()),
+            provider,
+            input_text,
+            raw,
+            redacted["output"],
+            1 if redacted["flagged"] else 0,
+            json.dumps(redacted["redactions"]),
+        ),
+    )
 
-# ---------------------------
-# Endpoints
-# ---------------------------
+# ---------- Routes ----------
 @app.get("/")
 def health():
     return {"status": "ok", "message": "GuardRail Wrapper server is running."}
 
-@app.get("/wake")
-def wake(background_tasks: BackgroundTasks):
-    # Optionally do some warm-up in background; we just no-op.
-    background_tasks.add_task(lambda: None)
-    return {"status": "ok", "message": "Server warmed up"}
-
-@app.post("/scan")
-def scan(req: ScanRequest):
-    input_text = req.prompt
-    # 1) Get model output (mock or OpenAI)
-    if USE_OPENAI:
-        try:
-            completion = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": input_text}],
-            )
-            llm_output = completion.choices[0].message.content or ""
-            provider = "openai"
-        except Exception:
-            llm_output = f"(mock) Answer to: {input_text}"
-            provider = "mock"
-    else:
-        llm_output = f"(mock) Answer to: {input_text}"
-        provider = "mock"
-
-    # 2) Guardrails
-    pii = redact_pii(llm_output)
-
-    # 3) Persist
-    ensure_schema()
-    db_exec(
-        """
-        INSERT INTO logs (ts, provider, input_text, raw_output, redacted_output, flagged, redactions_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            int(time.time()),
-            provider,
-            input_text,
-            llm_output,
-            pii["output"],
-            1 if pii["flagged"] else 0,
-            json.dumps(pii["redactions"]),
-        ),
-    )
-
-    # 4) Response
-    return {
-        "raw_output": llm_output,
-        "redacted_output": pii["output"],
-        "flagged": pii["flagged"],
-        "incidents": [],  # optional per-req incidents list
-    }
-
-@app.post("/chat")
-def chat(req: ChatRequest):
-    input_text = req.message
-
-    if USE_OPENAI:
-        try:
-            completion = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": input_text}],
-            )
-            answer = completion.choices[0].message.content or ""
-            provider = "openai"
-        except Exception:
-            answer = f"(mock) Answer: {input_text}"
-            provider = "mock"
-    else:
-        answer = f"(mock) Answer: {input_text}"
-        provider = "mock"
-
-    pii = redact_pii(answer)
-
-    ensure_schema()
-    db_exec(
-        """
-        INSERT INTO logs (ts, provider, input_text, raw_output, redacted_output, flagged, redactions_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            int(time.time()),
-            provider,
-            input_text,
-            answer,
-            pii["output"],
-            1 if pii["flagged"] else 0,
-            json.dumps(pii["redactions"]),
-        ),
-    )
-
-    return {
-        "answer": pii["output"],
-        "flagged": pii["flagged"],
-        "redactions": [r.get("type", "other") for r in pii["redactions"]],
-    }
-
 @app.get("/metrics")
 def metrics():
     ensure_schema()
-    total, flagged = db_query("SELECT COUNT(*), SUM(flagged) FROM logs")[0]
-    total = total or 0
-    flagged = flagged or 0
+    row = db_query("SELECT COUNT(*), SUM(flagged) FROM logs")[0]
+    total = row[0] or 0
+    flagged = row[1] or 0
+    flag_rate = (flagged / total) if total > 0 else 0.0
     return {
         "total_requests": total,
         "flagged_outputs": flagged,
-        "flag_rate": (flagged / total) if total else 0.0,
+        "flag_rate": flag_rate,
     }
 
 @app.get("/logs")
@@ -274,17 +217,17 @@ def get_logs(limit: int = Query(25, ge=1, le=500)):
         out.append(
             {
                 "id": r[0],
-                "time": r[1],
+                "timestamp": r[1],
                 "provider": r[2] or "mock",
                 "flagged": bool(r[3]),
-                "redactions": [x.get("type", "other") for x in json.loads(r[4] or "[]")],
+                "redactions": json.loads(r[4] or "[]"),
             }
         )
     return out
 
-@app.get("/incidents")
-def incidents(limit: int = 10):
-    # For now, reuse logs to simulate "incidents"
+@app.get("/incidents", response_model=List[Incident])
+def get_incidents(limit: int = 10):
+    # Build incidents from DB (newest first)
     ensure_schema()
     rows = db_query(
         """
@@ -293,17 +236,54 @@ def incidents(limit: int = 10):
         ORDER BY id DESC
         LIMIT ?
         """,
-        (limit,),
+        (limit,)
     )
-    out = []
+    items: List[Incident] = []
     for r in rows:
-        out.append(
-            {
-                "id": r[0],
-                "time": r[1],
-                "provider": r[2] or "mock",
-                "flagged": bool(r[3]),
-                "redactions": [x.get("type", "other") for x in json.loads(r[4] or "[]")],
-            }
+        redacts = [rd.get("type", "other") for rd in json.loads(r[4] or "[]")]
+        items.append(
+            Incident(
+                id=int(r[0]),
+                time=str(r[1]),
+                provider=str(r[2] or "mock"),
+                flagged=bool(r[3]),
+                redactions=redacts,
+            )
         )
-    return out
+    return items
+
+@app.post("/scan", response_model=ScanResponse)
+def scan(req: ScanRequest):
+    input_text = req.prompt.strip()
+    raw, provider = call_llm(input_text)
+    pii = redact_pii(raw)
+    persist_and_emit(raw, pii, provider, input_text)
+
+    # Build incidents list (last 10)
+    recent = get_incidents(limit=10)
+    return ScanResponse(
+        raw_output=raw,
+        redacted_output=pii["output"],
+        flagged=pii["flagged"],
+        incidents=recent
+    )
+
+@app.post("/chat", response_model=ChatReply)
+def chat(req: ChatRequest):
+    # Accept either {prompt} or {user,message}
+    input_text = (req.prompt or req.message or "").strip()
+    if not input_text:
+        # still return 200 with a friendly message (less brittle than 422)
+        return ChatReply(answer="(empty message)", flagged=False, redactions=[])
+
+    raw, provider = call_llm(input_text)
+    pii = redact_pii(raw)
+    persist_and_emit(raw, pii, provider, input_text)
+
+    # Adapt to ChatReply shape expected by the UI
+    redaction_types = [r.get("type", "other") for r in pii["redactions"]]
+    return ChatReply(
+        answer=pii["output"],
+        flagged=pii["flagged"],
+        redactions=redaction_types
+    )
